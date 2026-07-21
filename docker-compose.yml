@@ -20,7 +20,7 @@ services:
       - db
     env_file: .env
     environment:
-      DATABASE_URL: postgresql+psycopg2://root:root@db:5432/super-market
+      DATABASE_URL: ${DATABASE_URL}
     ports:
       - "8000:8000"
     volumes:
