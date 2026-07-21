@@ -1,0 +1,16 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.6
+sqlalchemy>=2.0.35
+psycopg2-binary>=2.9.9
+anthropic>=0.39.0
+python-dotenv>=1.0.1
+reportlab>=4.2.5
+python-pptx>=1.0.2
+matplotlib>=3.9.2
+alembic
+deepagents
+reportlab
+langgraph-checkpoint-postgres
+psycopg[binary]
+psycopg-pool
+apscheduler
