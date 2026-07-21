@@ -41,7 +41,10 @@ Telegram ──▶ FastAPI webhook (main.py)
                                               Alembic-managed schema
 ```
 
-Everything the owner can trigger — receiving stock, billing, khata, closing the day, invoices, decks, preferences — is a plain Python function decorated with `@tool` and registered in `build_agent()`. There is no admin UI or CRUD layer; the tool surface *is* the product.
+Everything the owner can trigger — receiving stock, billing, khata, closing the day, invoices, decks, preferences — is a plain Python function decorated with `@tool` and registered in `build_agent()`.Used apscheduler for sending khata reminder and analysis deck.
+Used Matplotlib to generate pptx and pdf
+ Supabase  - postgre database 
+ There is no admin UI or CRUD layer; the tool surface *is* the product.
 
 ## 3. Control loop
 
