@@ -1,57 +1,84 @@
-# Supermarket bot
+# Supermarket Bot
 
-Run an Indian kirana / supermarket store end-to-end from a Telegram chat — receiving stock, cutting GST-correct bills, running customer khata (credit), closing the day, and generating invoices and analysis decks on demand.
+Run an Indian kirana / supermarket store end-to-end from a Telegram chat — receive stock, cut GST-correct bills, run customer khata (credit), close the day, and generate invoices and analysis decks on demand.
 
-**Telegram bot:** `@Nikita@2811Bot`(Super Market handler)
+**Telegram bot:** `@Nikita@2811Bot` (Super Market handler)
 
 ---
 
 ## 1. Harness — why `deepagents`
 
-The agent is built on [`deepagents`] (`app/agent.py`), on top of LangGraph.
+The agent is built on [`deepagents`](app/agent.py), on top of LangGraph.
 
-Reasons for this choice over a hand-rolled loop or a plain Vercel-AI-SDK agent:
+Reasons for this choice over a hand-rolled loop or a plain Vercel AI SDK agent:
 
 - It gives a proper **observe → reason → act → feed-result-back → continue** loop for free, including chaining multiple tool calls in a single turn (e.g. `search_products` → `add_bill_item` → `add_bill_item` → `get_bill_draft` in one owner message).
 - It runs on LangGraph, which ships a first-class **Postgres checkpointer** (`PostgresSaver`). That's what backs both conversation-level memory (mid-bill edits, "drop the butter, make it 6 Maggi") and, combined with our own `Preference` table, durable memory that survives a new chat.
-- No intent router. There is no regex/keyword layer anywhere in this codebase — every decision about *which* tool to call, in what order, and whether to ask a clarifying question is made by the model, driven purely by tool descriptions and the system prompt in `build_agent()`.
+- **No intent router.** There is no regex/keyword layer anywhere in this codebase — every decision about *which* tool to call, in what order, and whether to ask a clarifying question is made by the model, driven purely by tool descriptions and the system prompt in `build_agent()`.
+
+---
 
 ## 2. Architecture
 
 ```
-Telegram ──▶ FastAPI webhook (main.py)
-               │
-               ├─ dedupe update_id (ProcessedUpdate table)
-               ├─ ensure chat_sessions row exists
-               ├─ text message ──────────────────┐
-               └─ voice note ─▶ Gemini transcribe ┘
-                                                    │
-                                          handle_telegram_message (bot.py)
-                                                    │
-                                    deepagents agent, thread_id = chat_id
-                                    (Postgres-checkpointed conversation state)(agent.py)
-                                                    │
-                        ┌───────────────┬───────────────┬────────────────┬──────────────┐
-                   product_tools   billing_tools   credit_leadger    analytics_tools  invoice_tools /
-                   (catalog/stock) (bills, GST,      _tools (khata)   / _document      analytics_document
-                                    oversell guard)                   (summaries,      (PDF / PPTX)
-                                                                        decks)
-                                                    │
-                                              Postgres (SQLAlchemy models, app/model.py)
-                                              Alembic-managed schema
+                                   ┌─────────────────────────────────────────────┐
+                                   │              Telegram (owner chat)           │
+                                   └───────────────┬───────────────────┬─────────┘
+                                                    │ inbound              ▲ outbound
+                                                    ▼                      │ sendMessage / sendDocument
+                                   FastAPI webhook (main.py)                │
+                                                    │                      │
+                          ┌─────────────────────────┼──────────────────┐   │
+                          │                         │                  │   │
+                 dedupe update_id            ensure chat_sessions  message type │
+              (ProcessedUpdate table)             row exists            │       │
+                                                    │                  │       │
+                                     ┌──────────────┴───────────┐      │       │
+                                text message                voice note │       │
+                                     │                     ─▶ Gemini transcribe │
+                                     └──────────────┬────────────┘      │       │
+                                                     ▼                          │
+                                       handle_telegram_message (bot.py)         │
+                                                     │                          │
+                                    deepagents agent, thread_id = chat_id       │
+                                    (Postgres-checkpointed conversation state, agent.py)
+                                                     │                          │
+                     ┌───────────────┬───────────────┼────────────────┬────────┴─────┐
+              product_tools    billing_tools   credit_ledger    analytics_tools  invoice_tools /
+              (catalog/stock)  (bills, GST,      _tools (khata)  / _document      analytics_document
+                                oversell guard)                  (summaries,       (PDF / PPTX)
+                                                                   decks)
+                                                     │
+                                               Postgres (SQLAlchemy models, app/model.py)
+                                               Alembic-managed schema
+                                                     ▲
+                                                     │ reads balances / sales
+                          ┌──────────────────────────┴──────────────────────────┐
+                          │                apscheduler (background jobs)        │
+                          │  ─ khata reminder job → renders due-balance message  │
+                          │    → sendMessage to customer/owner chat              │
+                          │  ─ analysis deck job → analytics_document           │
+                          │    (generate_report_pptx) → sendDocument to owner    │
+                          └──────────────────────────────────────────────────────┘
 ```
 
-Everything the owner can trigger — receiving stock, billing, khata, closing the day, invoices, decks, preferences — is a plain Python function decorated with `@tool` and registered in `build_agent()`.Used apscheduler for sending khata reminder and analysis deck.
-Used Matplotlib to generate pptx and pdf
- Supabase  - postgre database 
- There is no admin UI or CRUD layer; the tool surface *is* the product.
+Everything the owner can trigger — receiving stock, billing, khata, closing the day, invoices, decks, preferences — is a plain Python function decorated with `@tool` and registered in `build_agent()`. Two things run outside the reactive request/reply loop: `apscheduler` jobs for khata reminders and for scheduled analysis decks, both of which push messages back out over the Telegram Bot API rather than waiting on an inbound update.
+
+Matplotlib powers the chart generation feeding into the PDF/PPTX outputs. Supabase Postgres is the database of record.
+
+There is no admin UI or CRUD layer — the tool surface *is* the product.
+
+---
 
 ## 3. Control loop
 
 1. Telegram delivers an update to the webhook. The `update_id` is recorded so a redelivered update is a no-op.
-2. The message (or transcribed voice note) is handed to the agent as a single user turn, with `chat_id` used as both the LangGraph `thread_id` (for mid-conversation state, e.g. an in-progress bill) and passed into tool `config` where a tool needs to know which chat it's serving (e.g. `start_bill`).
+2. The message — or, for a voice note, its Gemini transcription — is handed to the agent as a single user turn, with `chat_id` used as both the LangGraph `thread_id` (for mid-conversation state, e.g. an in-progress bill) and passed into tool `config` where a tool needs to know which chat it's serving (e.g. `start_bill`).
 3. The model reasons over the message, calls whatever tools it needs — possibly several in sequence — and the results are fed back into its context before it produces a final reply.
 4. If a tool produced a file (`generate_invoice_pdf`, `generate_report_pptx`), the tool's return value embeds a `FILE_PATH:` marker; `bot.py` extracts it and `main.py` sends the file via `sendDocument` alongside the reply text.
+5. Independently of any inbound message, `apscheduler` runs two recurring jobs: one checks khata balances and sends reminder messages to customers past their credit terms, and one generates and pushes a sales analysis deck to the owner on a set cadence.
+
+---
 
 ## 4. Tool / skill surface
 
@@ -59,14 +86,16 @@ Used Matplotlib to generate pptx and pdf
 |---|---|---|
 | `product_tools.py` | `create_product`, `update_product`, `receive_stock`, `get_stock_level`, `get_product`, `search_products`, `list_low_stock`, `suggest_hsn` | Catalog, stock levels, HSN/GST metadata |
 | `billing_tools.py` | `start_bill`, `add_bill_item`, `update_bill_item`, `remove_bill_item`, `get_bill_draft`, `finalize_bill`, `cancel_bill` | Draft bills, GST math, oversell guard, atomic stock decrement, idempotent finalize |
-| `credit_leadger_tools.py` | `get_or_create_customer`, `add_credit`, `record_payment`, `get_balance` | Khata (credit ledger) |
+| `credit_ledger_tools.py` | `get_or_create_customer`, `add_credit`, `record_payment`, `get_balance` | Khata (credit ledger) |
 | `analytics_tools.py` | `get_daily_summary`, `close_day`, `get_sales_range` | Daily/range sales summaries, locking a day's numbers |
 | `invoice_tools.py` | `generate_invoice_pdf` | GST tax invoice as PDF (`invoice_template.py`) |
 | `analytics_document.py` | `generate_report_pptx` | Sales analysis deck with real charts (`chart_utils.py`) |
 | `preferences_tools.py` | `get_preference`, `set_preference`, `get_shop_details`, `set_shop_details` | Standing owner preferences and shop/GSTIN details, persisted outside the conversation |
-| `guardrails.py` | (not tools — shared helpers) | `check_oversell`, `check_not_below_cost`, `check_khata_settlement_is_valid`, `check_stock_change_is_legitimate` |
+| `guardrails.py` | *(not tools — shared helpers)* | `check_oversell`, `check_not_below_cost`, `check_khata_settlement_is_valid`, `check_stock_change_is_legitimate` |
 
 Tools are deliberately thin and single-purpose; composition (e.g. "look the product up, then decide whether to `add_bill_item` or ask a clarifying question") is wired to the model, not hardcoded.
+
+---
 
 ## 5. How each "hard part" is handled
 
@@ -78,20 +107,25 @@ Tools are deliberately thin and single-purpose; composition (e.g. "look the prod
 - **Concurrency.** Row-level locks (`with_for_update()`) on the product being sold protect `add_bill_item`, `update_bill_item`, and `finalize_bill` against a sale and a stock-in racing each other on the same SKU.
 - **Guardrails.** `check_not_below_cost` refuses (with a `force=True` override) selling under cost; oversell has no override; khata settlement is checked against the customer's actual balance before a payment is recorded.
 - **Real artifacts.** The PDF invoice (`reportlab`) and PPTX deck (`python-pptx` + `matplotlib`) are generated programmatically from live data.
+- **Voice input.** Voice notes are transcribed via Gemini before reaching the agent, so the owner can bill, receive stock, or query khata by speaking instead of typing.
+- **Proactive nudges.** `apscheduler` jobs run independently of any inbound Telegram update — one sends khata reminders once a balance crosses its due terms, another generates and delivers the sales analysis deck on a recurring cadence — so the owner gets pushed information without having to ask for it.
 - **Memory across sessions.** Standing preferences (default payment mode, preferred brand, shop name/GSTIN) live in a `Preference` table keyed by `owner_id` along with shop details, entirely separate from the LangGraph conversation thread — so they're available to a fresh `/new` chat, not just recalled from message history.
+
+---
 
 ## 6. Running it locally
 
 ```bash
 cp .env.example .env   # fill in TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET,
-                        # ANTHROPIC_API_KEY / AGENT_MODEL, GEMINI_API_KEY, DATABASE_URL
+                        # AGENT_MODEL, GEMINI_API_KEY, DATABASE_URL
 
 docker compose up --build
 docker compose exec bot alembic upgrade head
 ```
 
 Then point your Telegram bot's webhook at `https://<your-host>/webhook/<TELEGRAM_BOT_TOKEN>`.
-.
+
+---
 
 ## 7. Scenarios covered in the demo recording
 
@@ -103,5 +137,8 @@ Then point your Telegram bot's webhook at `https://<your-host>/webhook/<TELEGRAM
 6. Generate a sales analysis deck (PPTX) for a date range.
 7. Set a standing preference, start a `/new` chat, and show it's still remembered.
 
-## Important Note : 
-1. I deployed the bot agent on Render free instance so bot might take some time to reply back
+---
+
+## Note
+
+Deployed on a Render free instance, so the bot may take a few seconds to respond after periods of inactivity (cold start).
