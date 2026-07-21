@@ -13,7 +13,7 @@ logger = logging.getLogger("super-market-bot")
 def generate_invoice_pdf(bill_id: str) -> str:
     """Generate a GST-correct tax invoice PDF for a bill. Only works on
     finalized (or voided) bills — a draft has no locked totals to invoice yet.
-    Returns the file path of the generated PDF so it can be sent to the owner
+    Returns the file path of the generated PDF for application to make a downloadable link so it can be sent to the owner
     (e.g. via Telegram sendDocument)."""
     db = SessionLocal()
     try:
